@@ -1,4 +1,8 @@
 import time
+import logging
+import os
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Type, Dict, List
 from pydantic import BaseModel, Field
 from erc3 import erc3 as dev, ApiException, TaskInfo, ERC3
@@ -10,11 +14,77 @@ from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 
 
-
 CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
 CLI_BLUE = "\x1B[34m"
 CLI_CLR = "\x1B[0m"
+
+
+# Кастомный форматтер для консоли с цветами
+class ColoredFormatter(logging.Formatter):
+    """Форматтер с поддержкой цветов для консольного вывода"""
+    def format(self, record):
+        message = super().format(record)
+        # Цвета уже встроены в сообщение, просто возвращаем как есть
+        return message
+
+
+# Кастомный форматтер для файла без цветов
+class PlainFormatter(logging.Formatter):
+    """Форматтер без цветовых кодов для файлового вывода"""
+    def format(self, record):
+        message = super().format(record)
+        # Удаляем ANSI цветовые коды
+        import re
+        ansi_escape = re.compile(r'\x1B\[[0-9;]*m')
+        return ansi_escape.sub('', message)
+
+
+def setup_logging(log_dir: str = "logs") -> logging.Logger:
+    """
+    Настраивает логирование в консоль и файл.
+    Имя файла содержит дату и время запуска.
+    
+    Args:
+        log_dir: Директория для хранения логов
+    
+    Returns:
+        Настроенный логгер
+    """
+    # Создаем директорию для логов если не существует
+    log_path = Path(log_dir)
+    log_path.mkdir(parents=True, exist_ok=True)
+    
+    # Формируем имя файла с датой и временем
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_file = log_path / f"agent_{timestamp}.log"
+    
+    # Получаем или создаем логгер
+    logger = logging.getLogger("erc3_agent")
+    logger.setLevel(logging.INFO)
+    
+    # Очищаем существующие хэндлеры (если есть)
+    logger.handlers.clear()
+    
+    # Консольный хэндлер (с цветами)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(ColoredFormatter('%(message)s'))
+    logger.addHandler(console_handler)
+    
+    # Файловый хэндлер (без цветов, с временными метками)
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(PlainFormatter('%(asctime)s | %(message)s', datefmt='%H:%M:%S'))
+    logger.addHandler(file_handler)
+    
+    logger.info(f"Логирование настроено. Файл: {log_file}")
+    
+    return logger
+
+
+# Глобальный логгер
+logger = setup_logging()
 
 
 
@@ -73,14 +143,14 @@ class ERC3Tool(BaseTool):
             
             # Логируем вызов тула
             tool_call_log = f"{self.name}({', '.join(f'{k}={v}' for k, v in kwargs.items() if v is not None)})"
-            print(f"{CLI_BLUE}CALL{CLI_CLR}: {tool_call_log}")
+            logger.info(f"{CLI_BLUE}CALL{CLI_CLR}: {tool_call_log}")
             
             # Создаем объект запроса из kwargs
             request = self.request_class(**kwargs)
             # Выполняем запрос через API
             result = self.store_api.dispatch(request)
             txt = result.model_dump_json(exclude_none=True, exclude_unset=True)
-            print(f"{CLI_GREEN}OUT{CLI_CLR}: {txt}")
+            logger.info(f"{CLI_GREEN}OUT{CLI_CLR}: {txt}")
             
             # Для Req_ProvideAgentResponse отмечаем что ответ предоставлен
             if self.name == "Req_ProvideAgentResponse":
@@ -90,11 +160,11 @@ class ERC3Tool(BaseTool):
             return txt
         except ApiException as e:
             txt = f"API Error: {e.detail}"
-            print(f"{CLI_RED}ERR: {e.api_error.error}{CLI_CLR}")
+            logger.error(f"{CLI_RED}ERR: {e.api_error.error}{CLI_CLR}")
             return txt
         except Exception as e:
             txt = f"Error: {str(e)}"
-            print(f"{CLI_RED}ERR: {txt}{CLI_CLR}")
+            logger.error(f"{CLI_RED}ERR: {txt}{CLI_CLR}")
             return txt
 
 
@@ -121,7 +191,7 @@ def think_function(thoughts: str) -> str:
     Функция для фиксации размышлений агента.
     Принимает текстовые размышления и возвращает подтверждение.
     """
-    print(f"{CLI_BLUE}THINK{CLI_CLR}: {thoughts}")
+    logger.info(f"{CLI_BLUE}THINK{CLI_CLR}: {thoughts}")
     return "Thoughts recorded. Continue with your task."
 
 
@@ -130,7 +200,7 @@ def plan_function(plan: str) -> str:
     Функция для фиксации плана агента.
     Принимает текстовый план и возвращает подтверждение.
     """
-    print(f"{CLI_BLUE}PLAN{CLI_CLR}: {plan}")
+    logger.info(f"{CLI_BLUE}PLAN{CLI_CLR}: {plan}")
     return "Plan recorded. Proceed with execution."
 
 
@@ -161,12 +231,12 @@ def verify_function(
     
     links_str = ", ".join(links_summary) if links_summary else "none"
     
-    print(f"{CLI_BLUE}VERIFY{CLI_CLR}:")
-    print(f"  Outcome: {outcome}")
-    print(f"  Links: {links_str}")
-    print(f"  Modifications: {made_modifications}, Permissions checked: {permissions_checked}")
-    print(f"  Wiki checked: {wiki_checked}")
-    print(f"  Reasoning: {reasoning[:100]}{'...' if len(reasoning) > 100 else ''}")
+    logger.info(f"{CLI_BLUE}VERIFY{CLI_CLR}:")
+    logger.info(f"  Outcome: {outcome}")
+    logger.info(f"  Links: {links_str}")
+    logger.info(f"  Modifications: {made_modifications}, Permissions checked: {permissions_checked}")
+    logger.info(f"  Wiki checked: {wiki_checked}")
+    logger.info(f"  Reasoning: {reasoning[:100]}{'...' if len(reasoning) > 100 else ''}")
     
     # Проверки на потенциальные ошибки
     warnings = []
@@ -1299,7 +1369,7 @@ After a company merger/acquisition (M&A), rules may have changed. The wiki conta
                     cached_prompt_tokens=cached_prompt_tokens,  # Опциональное поле
                 )
             except Exception as e:
-                print(f"Warning: Failed to log LLM call: {e}")
+                logger.warning(f"Warning: Failed to log LLM call: {e}")
             finally:
                 self.start_time = None
         
@@ -1318,9 +1388,9 @@ After a company merger/acquisition (M&A), rules may have changed. The wiki conta
                         completion_tokens=0,
                         cached_prompt_tokens=0,
                     )
-                    print(f"{CLI_BLUE}Logged zero-usage LLM stats (no LLM calls in task){CLI_CLR}")
+                    logger.info(f"{CLI_BLUE}Logged zero-usage LLM stats (no LLM calls in task){CLI_CLR}")
                 except Exception as e:
-                    print(f"{CLI_RED}Failed to log zero-usage LLM stats: {e}{CLI_CLR}")
+                    logger.error(f"{CLI_RED}Failed to log zero-usage LLM stats: {e}{CLI_CLR}")
     
     # Создаем callback
     erc3_callback = ERC3LoggingCallback(api, task.task_id, model)
@@ -1336,7 +1406,7 @@ After a company merger/acquisition (M&A), rules may have changed. The wiki conta
     agent_executor = create_react_agent(llm, tools)
     
     # Запускаем агента
-    print(f"{CLI_BLUE}Starting LangGraph ReAct agent...{CLI_CLR}\n")
+    logger.info(f"{CLI_BLUE}Starting LangGraph ReAct agent...{CLI_CLR}\n")
     
     try:
         # Выполняем агента с входным сообщением (системный промпт в начале)
@@ -1351,8 +1421,8 @@ After a company merger/acquisition (M&A), rules may have changed. The wiki conta
         # Выводим финальный результат
         if result and "messages" in result:
             final_message = result["messages"][-1]
-            print(f"\n{CLI_BLUE}Agent completed.{CLI_CLR}")
-            print(f"Final response: {final_message.content}")
+            logger.info(f"\n{CLI_BLUE}Agent completed.{CLI_CLR}")
+            logger.info(f"Final response: {final_message.content}")
         
         # Если агент по какой-то причине не вызвал Req_ProvideAgentResponse, добиваем задачу автоматически
         if not _response_provided:
@@ -1381,15 +1451,15 @@ After a company merger/acquisition (M&A), rules may have changed. The wiki conta
                     )
                     store_api.dispatch(auto_req)
                     _response_provided = True
-                    print(f"{CLI_GREEN}OUT{CLI_CLR}: Auto-called Req_ProvideAgentResponse because the agent finished without it.")
+                    logger.info(f"{CLI_GREEN}OUT{CLI_CLR}: Auto-called Req_ProvideAgentResponse because the agent finished without it.")
                 else:
-                    print(f"{CLI_RED}WARNING{CLI_CLR}: Agent finished without Req_ProvideAgentResponse and no verify payload to auto-complete.")
+                    logger.warning(f"{CLI_RED}WARNING{CLI_CLR}: Agent finished without Req_ProvideAgentResponse and no verify payload to auto-complete.")
             except Exception as auto_e:
-                print(f"{CLI_RED}Failed to auto-complete with Req_ProvideAgentResponse: {auto_e}{CLI_CLR}")
+                logger.error(f"{CLI_RED}Failed to auto-complete with Req_ProvideAgentResponse: {auto_e}{CLI_CLR}")
             
     except Exception as e:
         error_str = str(e)
-        print(f"{CLI_RED}Agent error: {error_str}{CLI_CLR}")
+        logger.error(f"{CLI_RED}Agent error: {error_str}{CLI_CLR}")
         
         # Если ответ еще не был предоставлен и это ошибка API, попробуем отправить error_internal
         if not _response_provided:
@@ -1402,9 +1472,9 @@ After a company merger/acquisition (M&A), rules may have changed. The wiki conta
                     links=[]
                 )
                 store_api.dispatch(error_request)
-                print(f"{CLI_BLUE}Sent error_internal response due to agent failure{CLI_CLR}")
+                logger.info(f"{CLI_BLUE}Sent error_internal response due to agent failure{CLI_CLR}")
             except Exception as inner_e:
-                print(f"{CLI_RED}Failed to send error response: {inner_e}{CLI_CLR}")
+                logger.error(f"{CLI_RED}Failed to send error response: {inner_e}{CLI_CLR}")
         
         raise
     finally:
