@@ -20,6 +20,10 @@ All ERC functions are implemented as tools, plus a few additional tools followin
 
 Context is a single continuous thread: at any moment the agent can see the full chain of its own reasoning and actions. Everything else was achieved through careful prompt engineering.
 
+### Cost
+
+One full agent run on GPT-5.1 costs approximately **$5** for 106 tasks.
+
 ## Getting Started
 
 ### 1. Get Your API Key
@@ -44,7 +48,7 @@ All agents require:
 
 Here's an example of running the sgr-agent-store (a simple agent that solves the store benchmark):
 
-```
+```bash
 # Set up your environment variables
 export OPENAI_API_KEY=sk-...
 export ERC3_API_KEY=key-...
@@ -62,20 +66,6 @@ pip install -r requirements.txt
 # Run the agent
 python3 main.py
 ```
-
-this should look like this:
-
-![res/console.png](res/console.png)
-
-you can also go to the [Web UI]() and view your running session there:
-
-![res/session.png](res/session.png)
-
-Task execution view allows to see interactions of agent with the Benchmark in more detail:
-
-![res/log.png](res/log.png)
-
-
 
 # Available Agents
 
