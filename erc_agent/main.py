@@ -100,13 +100,12 @@ if failed_task_details:
         print()
     print("-"*40)
 
-# Отправляем сессию только если выполнили все задачи без провалов
-if args.only is None and failed_tests == 0:
-    core.submit_session(res.session_id)
-    print("Session submitted successfully!")
-elif args.only is not None:
+# Отправляем сессию если был полный прогон (без --only и без преждевременной остановки)
+if args.only is not None:
     print(f"Skipping session submission (only test #{args.only} was run)")
 elif args.fail_fast and failed_tests > 0:
     print(f"Skipping session submission (stopped early due to --fail-fast)")
 else:
-    print(f"Skipping session submission ({failed_tests} test(s) failed)")
+    # Полный прогон - подаём независимо от результатов
+    core.submit_session(res.session_id)
+    print("Session submitted successfully!")
