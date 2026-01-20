@@ -9,7 +9,7 @@ from openai import OpenAI
 from agent import run_agent
 from erc3 import ERC3
 from langchain_gigachat import GigaChat
-from api_logger import init_run_logger, finalize_task, get_run_logger, register_task
+from api_logger import init_run_logger, finalize_task, register_task
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Run ERC3 Agent tests')
@@ -22,30 +22,24 @@ parser.add_argument('--concurrency', type=int, default=1, metavar='N',
 args = parser.parse_args()
 
 core = ERC3()
-MODEL_ID = "gpt-5.2"
-# MODEL_ID = "GigaChat-3-Ultra"
+MODEL_ID = "gpt-4o"
 
 if MODEL_ID.startswith("GigaChat"):
     client = GigaChat(model=MODEL_ID, timeout=600)
 else:
     client = OpenAI()
 
-# Start session with metadata
-# Флаги: compete_accuracy - для призового соревнования 9 декабря
-# Другие флаги: compete_budget, compete_speed, compete_local (отдельные leaderboards)
 res = core.start_session(
-    # benchmark="erc3-prod",
-    benchmark="erc3-prod",
+    benchmark="erc3-dev",  # Use erc3-prod for competition
     workspace="my",
-    name=f"@Krestnikov (Giga team)",
-    architecture="React + think-tool + Structured reasoning",
+    name="ERC3 Agent",
+    architecture="ReAct + think/plan/verify tools",
     flags=["compete_accuracy"]
 )
 
 status = core.session_status(res.session_id)
 print(f"Session has {len(status.tasks)} tasks")
 
-# Инициализируем JSONL логгер для этого прогона
 run_logger = init_run_logger(MODEL_ID)
 run_logger.log_session_info(res.session_id, "erc3-prod", len(status.tasks))
 print(f"Logs will be saved to: {run_logger.get_run_dir()}")
@@ -60,26 +54,22 @@ if args.only is not None:
 else:
     tasks_to_run = status.tasks
 
-# Счетчики для статистики тестов
 passed_tests = 0
 failed_tests = 0
-failed_task_details = []  # Список для хранения информации о проваленных тестах
-stats_lock = threading.Lock()  # Для потокобезопасного обновления статистики
-stop_flag = threading.Event()  # Флаг для остановки при --fail-fast
+failed_task_details = []
+stats_lock = threading.Lock()
+stop_flag = threading.Event()
 
 
 def run_single_task(idx: int, task) -> dict:
-    """Выполняет одну задачу и возвращает результат"""
+    """Execute a single task and return result"""
     if stop_flag.is_set():
         return None
     
     print("="*40)
     print(f"Starting Task #{idx}: {task.task_id} ({task.spec_id}): {task.task_text}")
     
-    # Регистрируем задачу в логгере с порядковым номером
     register_task(task.task_id, idx)
-    
-    # start the task
     core.start_task(task)
     try:
         run_agent(MODEL_ID, core, task)
@@ -104,21 +94,15 @@ def run_single_task(idx: int, task) -> dict:
         task_result['score'] = 0
         task_result['logs'] = "No evaluation result"
     
-    # Финализируем файл лога задачи (переименовываем в GOOD/BAD)
     finalize_task(task.task_id, task_result['passed'])
-    
     return task_result
 
 
 if args.concurrency > 1:
-    # Параллельное выполнение
     print(f"Running tasks with concurrency={args.concurrency}")
-    
-    # Создаём список (idx, task) для запуска
     indexed_tasks = list(enumerate(tasks_to_run, start=(args.only if args.only else 1)))
     
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        # Отправляем все задачи на выполнение
         futures = {executor.submit(run_single_task, idx, task): (idx, task) 
                    for idx, task in indexed_tasks}
         
@@ -143,20 +127,16 @@ if args.concurrency > 1:
                     })
                     
                     if args.fail_fast:
-                        print(f"\n🛑 ОСТАНОВКА: Тест #{task_result['idx']} провален (--fail-fast)")
+                        print(f"\nStopping: Test #{task_result['idx']} failed (--fail-fast)")
                         stop_flag.set()
-                        # Отменяем оставшиеся задачи
                         for f in futures:
                             f.cancel()
                         break
 else:
-    # Последовательное выполнение (оригинальное поведение)
     for idx, task in enumerate(tasks_to_run, start=(args.only if args.only else 1)):
         print("="*40)
         print(f"Starting Task #{idx}: {task.task_id} ({task.spec_id}): {task.task_text}")
-        # Регистрируем задачу в логгере с порядковым номером
         register_task(task.task_id, idx)
-        # start the task
         core.start_task(task)
         try:
             run_agent(MODEL_ID, core, task)
@@ -167,13 +147,11 @@ else:
             explain = textwrap.indent(result.eval.logs, "  ")
             print(f"\nSCORE: {result.eval.score}\n{explain}\n")
             
-            # Подсчитываем пройденные/непройденные тесты
             task_passed = result.eval.score > 0
             if task_passed:
                 passed_tests += 1
             else:
                 failed_tests += 1
-                # Сохраняем информацию о проваленном тесте
                 failed_task_details.append({
                     'idx': idx,
                     'spec_id': task.spec_id,
@@ -181,40 +159,26 @@ else:
                     'reason': result.eval.logs.strip()
                 })
             
-            # Финализируем файл лога задачи (переименовываем в GOOD/BAD)
             finalize_task(task.task_id, task_passed)
             
-            # Останавливаемся при первом провале если указан --fail-fast
             if not task_passed and args.fail_fast:
-                print(f"\n🛑 ОСТАНОВКА: Тест #{idx} провален (--fail-fast)")
+                print(f"\nStopping: Test #{idx} failed (--fail-fast)")
                 break
 
-# Выводим статистику тестов
 print("="*40)
-print(f"РЕЗУЛЬТАТЫ ТЕСТИРОВАНИЯ:")
-print(f"  Пройдено: {passed_tests}")
-print(f"  Не пройдено: {failed_tests}")
-print(f"  Всего: {passed_tests + failed_tests}")
+print(f"RESULTS: Passed: {passed_tests}, Failed: {failed_tests}, Total: {passed_tests + failed_tests}")
 print("="*40)
 
-# Выводим список проваленных тестов
 if failed_task_details:
-    print("\n❌ СПИСОК ПРОВАЛЕННЫХ ТЕСТОВ:")
-    print("-"*40)
+    print("\nFailed tests:")
     for fail in failed_task_details:
-        print(f"  #{fail['idx']} ({fail['spec_id']})")
-        print(f"     Задача: {fail['task_text']}")
-        print(f"     Причина: {fail['reason']}")
-        print()
-    print("-"*40)
+        print(f"  #{fail['idx']} ({fail['spec_id']}): {fail['task_text']}")
 
-# Сортируем проваленные тесты по номеру для удобства
 failed_task_details.sort(key=lambda x: x['idx'])
 
-# Сохраняем итоговые результаты в JSONL директорию
 if run_logger:
     run_logger.log_session_results(passed_tests, failed_tests, failed_task_details)
-    print(f"\n📁 Логи сохранены в: {run_logger.get_run_dir()}")
+    print(f"\nLogs saved to: {run_logger.get_run_dir()}")
 
 # Отправляем сессию если был полный прогон (без --only и без преждевременной остановки)
 if args.only is not None:
