@@ -60,7 +60,7 @@
 
 ## LangGraph ReAct Agent
 
-Агент `store_agent.py` переделан на использование **LangGraph** и **LangChain** с применением `create_react_agent`.
+Агент `agent.py` переделан на использование **LangGraph** и **LangChain** с применением `create_react_agent`.
 
 ### Основные изменения:
 

@@ -1,9 +1,10 @@
 import time
 import logging
 import os
+import contextvars
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Type, Dict, List
+from typing import Any, Type, Dict, List, Optional
 from pydantic import BaseModel, Field
 from erc3 import erc3 as dev, ApiException, TaskInfo, ERC3
 
@@ -11,7 +12,10 @@ from langchain_core.tools import BaseTool, StructuredTool
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import SystemMessage
 from langchain_openai import ChatOpenAI
+from langchain_gigachat import GigaChat
 from langgraph.prebuilt import create_react_agent
+
+from api_logger import log_api_call
 
 
 CLI_RED = "\x1B[31m"
@@ -112,10 +116,57 @@ class VerifyInput(BaseModel):
     reasoning: str = Field(description="Brief explanation: why is this outcome correct? What question did user ask and how does your response answer it?")
 
 
-# Глобальные флаги и буфер последней verify-проверки
-_response_provided = False
-_verified = False
-_last_verify_payload: Dict[str, Any] = {}
+# ContextVar хранилище для изоляции состояния при параллельном выполнении
+# contextvars работает корректно с asyncio и потоками в отличие от threading.local()
+_context_state: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar('agent_state', default=None)
+
+# Глобальное хранилище состояния по task_id для надёжного отслеживания
+# при параллельном выполнении (fallback если contextvars не работает)
+_task_states: Dict[str, Dict[str, Any]] = {}
+_current_task_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar('current_task_id', default=None)
+
+
+def _create_initial_state() -> Dict[str, Any]:
+    """Создать начальное состояние агента"""
+    return {
+        'response_provided': False,
+        'verified': False,
+        'last_verify_payload': {},
+        'api_call_cache': {},
+        'wiki_cache': {},
+    }
+
+
+def _get_thread_state() -> Dict[str, Any]:
+    """Получить состояние для текущего контекста выполнения"""
+    # Сначала пробуем получить по task_id (более надёжно при параллельном выполнении)
+    task_id = _current_task_id.get()
+    if task_id and task_id in _task_states:
+        return _task_states[task_id]
+    
+    # Fallback на contextvars
+    state = _context_state.get()
+    if state is None:
+        state = _create_initial_state()
+        _context_state.set(state)
+    return state
+
+
+def _reset_thread_state(task_id: Optional[str] = None):
+    """Сбросить состояние для новой задачи"""
+    new_state = _create_initial_state()
+    _context_state.set(new_state)
+    
+    # Также сохраняем в глобальное хранилище по task_id
+    if task_id:
+        _task_states[task_id] = new_state
+        _current_task_id.set(task_id)
+
+
+def _cleanup_task_state(task_id: str):
+    """Очистить состояние после завершения задачи"""
+    if task_id in _task_states:
+        del _task_states[task_id]
 
 # Базовый класс для создания инструментов из ERC3 API
 class ERC3Tool(BaseTool):
@@ -126,45 +177,86 @@ class ERC3Tool(BaseTool):
     class Config:
         arbitrary_types_allowed = True
     
+    def _get_state_reliable(self) -> Dict[str, Any]:
+        """Надёжно получить состояние, сначала по task_id, потом через contextvars"""
+        task_id = _current_task_id.get()
+        if task_id and task_id in _task_states:
+            return _task_states[task_id]
+        return _get_thread_state()
+    
     def _run(self, **kwargs) -> str:
         """Выполнить запрос к API"""
-        global _response_provided
+        state = self._get_state_reliable()
+        task_id = _current_task_id.get() or "unknown"
         
         # Если ответ уже был предоставлен, не выполняем дальнейшие действия
-        if _response_provided and self.name == "Req_ProvideAgentResponse":
+        if state['response_provided'] and self.name == "Req_ProvideAgentResponse":
             return "TASK ALREADY COMPLETED - Response was already provided. Stop calling tools."
         
         try:
-            # Ограничиваем размер страницы если он указан
-            if 'page' in kwargs and kwargs['page'] is not None:
-                # Максимальный размер страницы = 5
-                if kwargs['page'] > 5:
-                    kwargs['page'] = 5
+            # Ограничиваем размер страницы если он указан (API лимит = 3)
+            if 'limit' in kwargs and kwargs['limit'] is not None:
+                if kwargs['limit'] > 3:
+                    kwargs['limit'] = 3
             
-            # Логируем вызов тула
+            # Формируем ключ кэша (только для GET-запросов, не для модифицирующих)
             tool_call_log = f"{self.name}({', '.join(f'{k}={v}' for k, v in kwargs.items() if v is not None)})"
-            logger.info(f"{CLI_BLUE}CALL{CLI_CLR}: {tool_call_log}")
+            
+            # Проверяем кэш для немодифицирующих запросов
+            is_read_only = not any(x in self.name for x in ['Update', 'Log', 'Provide'])
+            cache_key = f"{self.name}:{str(sorted(kwargs.items()))}"
+            
+            if is_read_only and cache_key in state['api_call_cache']:
+                logger.info(f"{CLI_GREEN}[{task_id}] CACHE{CLI_CLR}: {tool_call_log}")
+                # Логируем cache hit в JSONL
+                log_api_call(task_id, "cache_hit", self.name, {"args": kwargs})
+                return state['api_call_cache'][cache_key]
+            
+            logger.info(f"{CLI_BLUE}[{task_id}] CALL{CLI_CLR}: {tool_call_log}")
+            
+            # Логируем запрос в JSONL
+            log_api_call(task_id, "request", self.name, {"args": kwargs})
             
             # Создаем объект запроса из kwargs
             request = self.request_class(**kwargs)
             # Выполняем запрос через API
             result = self.store_api.dispatch(request)
             txt = result.model_dump_json(exclude_none=True, exclude_unset=True)
-            logger.info(f"{CLI_GREEN}OUT{CLI_CLR}: {txt}")
+            logger.info(f"{CLI_GREEN}[{task_id}] OUT{CLI_CLR}: {txt}")
+            
+            # Логируем ответ в JSONL (парсим JSON чтобы сохранить структуру)
+            try:
+                import json
+                response_data = json.loads(txt)
+            except:
+                response_data = txt
+            log_api_call(task_id, "response", self.name, response_data)
+            
+            # Сохраняем в кэш для read-only запросов
+            if is_read_only:
+                state['api_call_cache'][cache_key] = txt
             
             # Для Req_ProvideAgentResponse отмечаем что ответ предоставлен
             if self.name == "Req_ProvideAgentResponse":
-                _response_provided = True
+                state['response_provided'] = True
+                # Также обновляем в глобальном хранилище для надёжности
+                actual_task_id = _current_task_id.get()
+                if actual_task_id and actual_task_id in _task_states:
+                    _task_states[actual_task_id]['response_provided'] = True
                 return txt + "\n\nTASK COMPLETED SUCCESSFULLY. You have provided the final response. Do not call any more tools. The task is finished."
             
             return txt
         except ApiException as e:
             txt = f"API Error: {e.detail}"
-            logger.error(f"{CLI_RED}ERR: {e.api_error.error}{CLI_CLR}")
+            logger.error(f"{CLI_RED}[{task_id}] ERR: {e.api_error.error}{CLI_CLR}")
+            # Логируем ошибку в JSONL
+            log_api_call(task_id, "error", self.name, {"args": kwargs, "error": str(e.detail)})
             return txt
         except Exception as e:
             txt = f"Error: {str(e)}"
-            logger.error(f"{CLI_RED}ERR: {txt}{CLI_CLR}")
+            logger.error(f"{CLI_RED}[{task_id}] ERR: {txt}{CLI_CLR}")
+            # Логируем ошибку в JSONL
+            log_api_call(task_id, "error", self.name, {"args": kwargs, "error": str(e)})
             return txt
 
 
@@ -191,7 +283,10 @@ def think_function(thoughts: str) -> str:
     Функция для фиксации размышлений агента.
     Принимает текстовые размышления и возвращает подтверждение.
     """
-    logger.info(f"{CLI_BLUE}THINK{CLI_CLR}: {thoughts}")
+    task_id = _current_task_id.get() or "unknown"
+    logger.info(f"{CLI_BLUE}[{task_id}] THINK{CLI_CLR}: {thoughts}")
+    # Логируем в JSONL
+    log_api_call(task_id, "think", "think", {"thoughts": thoughts})
     return "Thoughts recorded. Continue with your task."
 
 
@@ -200,7 +295,10 @@ def plan_function(plan: str) -> str:
     Функция для фиксации плана агента.
     Принимает текстовый план и возвращает подтверждение.
     """
-    logger.info(f"{CLI_BLUE}PLAN{CLI_CLR}: {plan}")
+    task_id = _current_task_id.get() or "unknown"
+    logger.info(f"{CLI_BLUE}[{task_id}] PLAN{CLI_CLR}: {plan}")
+    # Логируем в JSONL
+    log_api_call(task_id, "plan", "plan", {"plan": plan})
     return "Plan recorded. Proceed with execution."
 
 
@@ -218,7 +316,13 @@ def verify_function(
     Структурированная верификация перед финальным ответом.
     Проверяет что агент явно продумал outcome, links и соблюдение правил.
     """
-    global _verified, _last_verify_payload
+    task_id = _current_task_id.get() or "unknown"
+    
+    # Получаем состояние надёжным способом
+    if task_id != "unknown" and task_id in _task_states:
+        state = _task_states[task_id]
+    else:
+        state = _get_thread_state()
     
     # Форматируем вывод
     links_summary = []
@@ -231,7 +335,7 @@ def verify_function(
     
     links_str = ", ".join(links_summary) if links_summary else "none"
     
-    logger.info(f"{CLI_BLUE}VERIFY{CLI_CLR}:")
+    logger.info(f"{CLI_BLUE}[{task_id}] VERIFY{CLI_CLR}:")
     logger.info(f"  Outcome: {outcome}")
     logger.info(f"  Links: {links_str}")
     logger.info(f"  Modifications: {made_modifications}, Permissions checked: {permissions_checked}")
@@ -253,14 +357,26 @@ def verify_function(
     if outcome == 'none_clarification_needed' and 'ok_answer' in reasoning.lower():
         warnings.append("WARNING: You mentioned ok_answer but chose none_clarification_needed - are you sure?")
     
-    _verified = True
-    _last_verify_payload = {
+    state['verified'] = True
+    state['last_verify_payload'] = {
         "outcome": outcome,
         "employee_links": employee_links,
         "project_links": project_links,
         "customer_links": customer_links,
         "reasoning": reasoning,
     }
+    
+    # Логируем в JSONL
+    log_api_call(task_id, "verify", "verify", {
+        "outcome": outcome,
+        "employee_links": employee_links,
+        "project_links": project_links,
+        "customer_links": customer_links,
+        "made_modifications": made_modifications,
+        "permissions_checked": permissions_checked,
+        "wiki_checked": wiki_checked,
+        "reasoning": reasoning
+    })
     
     result = f"""Verification recorded.
 
@@ -278,17 +394,318 @@ DO NOT respond with text. You MUST call the Req_ProvideAgentResponse tool now.""
     return result
 
 
+# =============================================================================
+# HELPER-ФУНКЦИИ ДЛЯ ПРОГРАММНОЙ ЗАГРУЗКИ МНОГОСТРАНИЧНЫХ ДАННЫХ
+# =============================================================================
+
+def _paginate_employees(store_api, department: str = None, location: str = None, 
+                        skills: list = None, wills: list = None) -> List[dict]:
+    """
+    Загружает всех сотрудников с автоматической пагинацией.
+    Возвращает список всех сотрудников без необходимости множественных вызовов агента.
+    """
+    all_employees = []
+    offset = 0
+    max_iterations = 50  # Защита от бесконечного цикла
+    
+    for _ in range(max_iterations):
+        try:
+            request = dev.Req_SearchEmployees(
+                department=department,
+                limit=3,
+                offset=offset,
+                skills=skills or [],
+                wills=wills or []
+            )
+            result = store_api.dispatch(request)
+            
+            if hasattr(result, 'employees') and result.employees:
+                all_employees.extend([emp.model_dump() for emp in result.employees])
+            
+            if result.next_offset == -1:
+                break
+            offset = result.next_offset
+        except Exception as e:
+            logger.error(f"{CLI_RED}Pagination error: {e}{CLI_CLR}")
+            break
+    
+    return all_employees
+
+
+def _paginate_customers(store_api, deal_phase: list = None, 
+                        account_managers: list = None) -> List[dict]:
+    """
+    Загружает всех клиентов с автоматической пагинацией.
+    """
+    all_customers = []
+    offset = 0
+    max_iterations = 50
+    
+    for _ in range(max_iterations):
+        try:
+            request = dev.Req_ListCustomers(
+                limit=3,
+                offset=offset
+            )
+            result = store_api.dispatch(request)
+            
+            if hasattr(result, 'companies') and result.companies:
+                all_customers.extend([c.model_dump() for c in result.companies])
+            
+            if result.next_offset == -1:
+                break
+            offset = result.next_offset
+        except Exception as e:
+            logger.error(f"{CLI_RED}Pagination error: {e}{CLI_CLR}")
+            break
+    
+    return all_customers
+
+
+def _get_employee_workload(store_api, employee_id: str) -> float:
+    """
+    Вычисляет суммарную загрузку сотрудника (сумму time_slice по всем проектам).
+    """
+    total_workload = 0.0
+    
+    try:
+        # Ищем все проекты где сотрудник в команде
+        request = dev.Req_SearchProjects(
+            team={"employee_id": employee_id},
+            status=['idea', 'exploring', 'active', 'paused', 'archived'],
+            include_archived=True,
+            limit=3,
+            offset=0
+        )
+        result = store_api.dispatch(request)
+        
+        if hasattr(result, 'projects') and result.projects:
+            for proj in result.projects:
+                # Получаем детали проекта чтобы узнать time_slice
+                proj_detail = store_api.dispatch(dev.Req_GetProject(id=proj.id))
+                if proj_detail.found and hasattr(proj_detail.project, 'team'):
+                    for member in proj_detail.project.team:
+                        if member.employee == employee_id:
+                            total_workload += member.time_slice
+    except Exception as e:
+        logger.error(f"{CLI_RED}Workload calculation error: {e}{CLI_CLR}")
+    
+    return total_workload
+
+
+def _find_busiest_in_department(store_api, department: str) -> dict:
+    """
+    Находит самого загруженного сотрудника в отделе.
+    Возвращает словарь с информацией о сотруднике и его загрузке.
+    """
+    employees = _paginate_employees(store_api, department=department)
+    
+    if not employees:
+        return {"found": False, "message": f"No employees found in department '{department}'"}
+    
+    max_workload = -1
+    busiest_employee = None
+    workloads = []
+    
+    for emp in employees:
+        workload = _get_employee_workload(store_api, emp['id'])
+        workloads.append({"employee": emp, "workload": workload})
+        
+        if workload > max_workload:
+            max_workload = workload
+            busiest_employee = emp
+    
+    return {
+        "found": True,
+        "busiest": busiest_employee,
+        "workload": max_workload,
+        "total_employees_checked": len(employees),
+        "all_workloads": workloads
+    }
+
+
+def _find_least_busy_in_location(store_api, location: str) -> dict:
+    """
+    Находит наименее загруженного сотрудника в локации.
+    """
+    # Поиск по location через query
+    all_employees = []
+    offset = 0
+    
+    for _ in range(50):
+        try:
+            request = dev.Req_SearchEmployees(
+                query=location,
+                limit=3,
+                offset=offset,
+                skills=[],
+                wills=[]
+            )
+            result = store_api.dispatch(request)
+            
+            if hasattr(result, 'employees') and result.employees:
+                # Фильтруем по location
+                for emp in result.employees:
+                    emp_dict = emp.model_dump()
+                    if location.lower() in emp_dict.get('location', '').lower():
+                        all_employees.append(emp_dict)
+            
+            if result.next_offset == -1:
+                break
+            offset = result.next_offset
+        except Exception:
+            break
+    
+    if not all_employees:
+        return {"found": False, "message": f"No employees found in location '{location}'"}
+    
+    min_workload = float('inf')
+    least_busy = None
+    workloads = []
+    
+    for emp in all_employees:
+        workload = _get_employee_workload(store_api, emp['id'])
+        workloads.append({"employee": emp, "workload": workload})
+        
+        if workload < min_workload:
+            min_workload = workload
+            least_busy = emp
+    
+    return {
+        "found": True,
+        "least_busy": least_busy,
+        "workload": min_workload,
+        "total_employees_checked": len(all_employees),
+        "all_workloads": workloads
+    }
+
+
+def _get_customers_by_deal_phase_with_managers(store_api, deal_phase: str) -> dict:
+    """
+    Получает всех клиентов в определённой фазе сделки вместе с их account managers.
+    """
+    all_customers = _paginate_customers(store_api)
+    
+    # Фильтруем по deal_phase
+    filtered = [c for c in all_customers if c.get('deal_phase') == deal_phase]
+    
+    # Получаем детали с account_manager
+    result_customers = []
+    manager_counts = {}
+    
+    for cust in filtered:
+        try:
+            detail = store_api.dispatch(dev.Req_GetCustomer(id=cust['id']))
+            if detail.found:
+                cust_data = detail.company.model_dump()
+                result_customers.append(cust_data)
+                
+                manager = cust_data.get('account_manager')
+                if manager:
+                    manager_counts[manager] = manager_counts.get(manager, 0) + 1
+        except Exception:
+            continue
+    
+    # Находим менеджера с максимумом
+    top_manager = None
+    max_count = 0
+    for mgr, count in manager_counts.items():
+        if count > max_count:
+            max_count = count
+            top_manager = mgr
+    
+    return {
+        "customers": result_customers,
+        "total_count": len(result_customers),
+        "manager_counts": manager_counts,
+        "top_manager": top_manager,
+        "top_manager_count": max_count
+    }
+
+
+# =============================================================================
+# PYDANTIC МОДЕЛИ ДЛЯ АГРЕГИРУЮЩИХ ИНСТРУМЕНТОВ
+# =============================================================================
+
+class FindBusiestInDepartmentInput(BaseModel):
+    """Аргументы для поиска самого загруженного сотрудника в отделе"""
+    department: str = Field(description="Department name (e.g., 'Production – Italy', 'Sales & Customer Success')")
+
+
+class FindLeastBusyInLocationInput(BaseModel):
+    """Аргументы для поиска наименее загруженного сотрудника в локации"""
+    location: str = Field(description="Location name (e.g., 'Paris Office – France', 'Vienna Office – Austria')")
+
+
+class GetCustomersByDealPhaseInput(BaseModel):
+    """Аргументы для получения клиентов по фазе сделки"""
+    deal_phase: str = Field(description="Deal phase: 'idea', 'exploring', 'active', 'paused', or 'archived'")
+
+
+class GetEmployeeWorkloadInput(BaseModel):
+    """Аргументы для получения загрузки сотрудника"""
+    employee_id: str = Field(description="Employee ID")
+
+
+class GetAllEmployeesInDepartmentInput(BaseModel):
+    """Аргументы для получения всех сотрудников отдела"""
+    department: str = Field(description="Department name")
+
+
+# =============================================================================
+# КЭШИРОВАНИЕ WIKI
+# =============================================================================
+
+
+def _check_wiki_merger(store_api) -> dict:
+    """
+    Проверяет wiki один раз и кэширует результат.
+    Возвращает информацию о наличии merger.md и его содержимом.
+    """
+    state = _get_thread_state()
+    wiki_cache = state['wiki_cache']
+    
+    if 'checked' in wiki_cache:
+        return wiki_cache
+    
+    try:
+        wiki_list = store_api.dispatch(dev.Req_ListWiki())
+        paths = wiki_list.paths if hasattr(wiki_list, 'paths') else []
+        
+        wiki_cache['paths'] = paths
+        wiki_cache['has_merger'] = 'merger.md' in paths
+        wiki_cache['merger_content'] = None
+        
+        if wiki_cache['has_merger']:
+            try:
+                merger = store_api.dispatch(dev.Req_LoadWiki(file='merger.md'))
+                wiki_cache['merger_content'] = merger.content if hasattr(merger, 'content') else None
+            except Exception:
+                wiki_cache['merger_content'] = None
+        
+        wiki_cache['checked'] = True
+    except Exception as e:
+        state['wiki_cache'] = {'checked': True, 'has_merger': False, 'paths': [], 'merger_content': None}
+        wiki_cache = state['wiki_cache']
+    
+    return wiki_cache
+
+
 def run_agent(model: str, api: ERC3, task: TaskInfo):
     """Запускает агента на основе LangGraph и LangChain"""
     
-    # Сбрасываем флаги для новой задачи
-    global _response_provided, _verified, _last_verify_payload
-    _response_provided = False
-    _verified = False
-    _last_verify_payload = {}
+    # Сбрасываем состояние для новой задачи с привязкой к task_id
+    task_id = task.task_id
+    _reset_thread_state(task_id)
+    
+    # Логируем начало задачи с task_id для отслеживания при параллельном выполнении
+    logger.info(f"{CLI_BLUE}[{task_id}]{CLI_CLR} Initializing agent...")
     
     store_api = api.get_erc_dev_client(task)
     about = store_api.who_am_i()
+    
+    # Предварительно проверяем wiki и кэшируем результат
+    wiki_info = _check_wiki_merger(store_api)
 
     system_prompt = f"""
 You are a business assistant helping customers of Aetherion.
@@ -1096,6 +1513,27 @@ After a company merger/acquisition (M&A), rules may have changed. The wiki conta
 - ALWAYS choose the project with explicit CV keywords, don't ask for clarification
 - RIGHT: "Line 3 Defect Detection PoC" has "Computer vision" → use it immediately
 - WRONG: Treating "Operations Room Monitoring" as a CV project when it's not
+
+## WIKI CACHE (PRE-LOADED)
+
+Wiki has been pre-checked for this task:
+- **merger.md exists**: {wiki_info.get('has_merger', False)}
+- **Wiki paths available**: {len(wiki_info.get('paths', []))} files
+
+{"**merger.md content (IMPORTANT - include required branding in responses):**" + chr(10) + wiki_info.get('merger_content', '') if wiki_info.get('merger_content') else "No merger.md found - no special branding required."}
+
+Since wiki is pre-cached, you do NOT need to call Req_ListWiki or Req_LoadWiki(file='merger.md') unless you need OTHER wiki files.
+
+## AGGREGATION TOOLS (USE FOR COMPLEX QUERIES)
+
+For queries like "busiest employee in department X" or "least busy in location Y", use the specialized aggregation tools:
+- **Agg_FindBusiestInDepartment**: Finds employee with highest project workload in a department (handles pagination automatically)
+- **Agg_FindLeastBusyInLocation**: Finds employee with lowest project workload in a location
+- **Agg_GetCustomersByDealPhase**: Gets all customers in a deal phase with their account managers (handles pagination automatically)
+- **Agg_GetEmployeeWorkload**: Gets total time_slice workload for a specific employee
+- **Agg_GetAllEmployeesInDepartment**: Gets all employees in a department (handles pagination automatically)
+
+These tools do ALL pagination internally in ONE call - much more efficient than manual pagination!
 """
     if about.current_user:
         usr = store_api.get_employee(about.current_user)
@@ -1269,6 +1707,96 @@ After a company merger/acquisition (M&A), rules may have changed. The wiki conta
         ),
     ]
     
+    # ==========================================================================
+    # АГРЕГИРУЮЩИЕ ИНСТРУМЕНТЫ (программная пагинация и вычисления)
+    # ==========================================================================
+    
+    def agg_find_busiest_in_department(department: str) -> str:
+        """Находит самого загруженного сотрудника в отделе"""
+        tid = _current_task_id.get() or "unknown"
+        logger.info(f"{CLI_BLUE}[{tid}] CALL{CLI_CLR}: Agg_FindBusiestInDepartment(department={department})")
+        result = _find_busiest_in_department(store_api, department)
+        import json
+        txt = json.dumps(result, ensure_ascii=False, default=str)
+        logger.info(f"{CLI_GREEN}[{tid}] OUT{CLI_CLR}: {txt[:500]}{'...' if len(txt) > 500 else ''}")
+        return txt
+    
+    def agg_find_least_busy_in_location(location: str) -> str:
+        """Находит наименее загруженного сотрудника в локации"""
+        tid = _current_task_id.get() or "unknown"
+        logger.info(f"{CLI_BLUE}[{tid}] CALL{CLI_CLR}: Agg_FindLeastBusyInLocation(location={location})")
+        result = _find_least_busy_in_location(store_api, location)
+        import json
+        txt = json.dumps(result, ensure_ascii=False, default=str)
+        logger.info(f"{CLI_GREEN}[{tid}] OUT{CLI_CLR}: {txt[:500]}{'...' if len(txt) > 500 else ''}")
+        return txt
+    
+    def agg_get_customers_by_deal_phase(deal_phase: str) -> str:
+        """Получает всех клиентов в фазе сделки с их account managers"""
+        tid = _current_task_id.get() or "unknown"
+        logger.info(f"{CLI_BLUE}[{tid}] CALL{CLI_CLR}: Agg_GetCustomersByDealPhase(deal_phase={deal_phase})")
+        result = _get_customers_by_deal_phase_with_managers(store_api, deal_phase)
+        import json
+        txt = json.dumps(result, ensure_ascii=False, default=str)
+        logger.info(f"{CLI_GREEN}[{tid}] OUT{CLI_CLR}: {txt[:500]}{'...' if len(txt) > 500 else ''}")
+        return txt
+    
+    def agg_get_employee_workload(employee_id: str) -> str:
+        """Получает суммарную загрузку сотрудника"""
+        tid = _current_task_id.get() or "unknown"
+        logger.info(f"{CLI_BLUE}[{tid}] CALL{CLI_CLR}: Agg_GetEmployeeWorkload(employee_id={employee_id})")
+        workload = _get_employee_workload(store_api, employee_id)
+        import json
+        result = {"employee_id": employee_id, "total_workload": workload}
+        txt = json.dumps(result, ensure_ascii=False)
+        logger.info(f"{CLI_GREEN}[{tid}] OUT{CLI_CLR}: {txt}")
+        return txt
+    
+    def agg_get_all_employees_in_department(department: str) -> str:
+        """Получает всех сотрудников отдела"""
+        tid = _current_task_id.get() or "unknown"
+        logger.info(f"{CLI_BLUE}[{tid}] CALL{CLI_CLR}: Agg_GetAllEmployeesInDepartment(department={department})")
+        employees = _paginate_employees(store_api, department=department)
+        import json
+        result = {"employees": employees, "total_count": len(employees)}
+        txt = json.dumps(result, ensure_ascii=False, default=str)
+        logger.info(f"{CLI_GREEN}[{tid}] OUT{CLI_CLR}: Found {len(employees)} employees")
+        return txt
+    
+    # Добавляем агрегирующие инструменты в список
+    tools.extend([
+        StructuredTool.from_function(
+            func=agg_find_busiest_in_department,
+            name="Agg_FindBusiestInDepartment",
+            description="Find the employee with HIGHEST project workload (sum of time_slices) in a department. Handles ALL pagination internally - just one call! Use for 'busiest employee in X department' queries.",
+            args_schema=FindBusiestInDepartmentInput
+        ),
+        StructuredTool.from_function(
+            func=agg_find_least_busy_in_location,
+            name="Agg_FindLeastBusyInLocation", 
+            description="Find the employee with LOWEST project workload (sum of time_slices) in a location. Handles ALL pagination internally - just one call! Use for 'least busy at X location' queries.",
+            args_schema=FindLeastBusyInLocationInput
+        ),
+        StructuredTool.from_function(
+            func=agg_get_customers_by_deal_phase,
+            name="Agg_GetCustomersByDealPhase",
+            description="Get ALL customers in a specific deal phase with their account managers, and find which manager has the most. Handles ALL pagination internally. Use for 'who has most exploring deals' queries.",
+            args_schema=GetCustomersByDealPhaseInput
+        ),
+        StructuredTool.from_function(
+            func=agg_get_employee_workload,
+            name="Agg_GetEmployeeWorkload",
+            description="Get total project workload (sum of time_slices across all projects) for a specific employee.",
+            args_schema=GetEmployeeWorkloadInput
+        ),
+        StructuredTool.from_function(
+            func=agg_get_all_employees_in_department,
+            name="Agg_GetAllEmployeesInDepartment",
+            description="Get ALL employees in a department. Handles ALL pagination internally - returns complete list in one call.",
+            args_schema=GetAllEmployeesInDepartmentInput
+        ),
+    ])
+    
     # Создаем callback handler для логирования
     class ERC3LoggingCallback(BaseCallbackHandler):
         """Callback для логирования LLM вызовов через ERC3 API
@@ -1290,6 +1818,13 @@ After a company merger/acquisition (M&A), rules may have changed. The wiki conta
         def on_llm_start(self, serialized: Dict[str, Any], prompts: List[str], **kwargs) -> None:
             """Вызывается при начале LLM запроса"""
             self.start_time = time.time()
+            # Логируем запрос к LLM в JSONL
+            log_api_call(
+                self.task_id, 
+                "llm_request", 
+                self.model_name,
+                {"prompts": prompts[:2] if len(prompts) > 2 else prompts}  # Ограничиваем размер
+            )
         
         def on_llm_end(self, response, **kwargs) -> None:
             """Вызывается при завершении LLM запроса"""
@@ -1368,6 +1903,19 @@ After a company merger/acquisition (M&A), rules may have changed. The wiki conta
                     completion_tokens=completion_tokens,
                     cached_prompt_tokens=cached_prompt_tokens,  # Опциональное поле
                 )
+                
+                # Логируем LLM ответ в JSONL
+                log_api_call(
+                    self.task_id,
+                    "llm_response",
+                    self.model_name,
+                    {
+                        "completion": completion_text[:1000] if len(completion_text) > 1000 else completion_text,
+                        "duration_sec": round(duration, 3),
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens
+                    }
+                )
             except Exception as e:
                 logger.warning(f"Warning: Failed to log LLM call: {e}")
             finally:
@@ -1396,17 +1944,24 @@ After a company merger/acquisition (M&A), rules may have changed. The wiki conta
     erc3_callback = ERC3LoggingCallback(api, task.task_id, model)
     
     # Создаем LLM с callback
-    llm = ChatOpenAI(
-        model=model,
-        temperature=0,
-        callbacks=[erc3_callback]
-    )
+    if model.startswith("GigaChat"):
+        llm = GigaChat(
+            model=model,
+            temperature=0,
+            callbacks=[erc3_callback]
+        )
+    else:
+        llm = ChatOpenAI(
+            model=model,
+            temperature=0,
+            callbacks=[erc3_callback]
+        )
     
     # Создаем агента с помощью create_react_agent
     agent_executor = create_react_agent(llm, tools)
     
     # Запускаем агента
-    logger.info(f"{CLI_BLUE}Starting LangGraph ReAct agent...{CLI_CLR}\n")
+    logger.info(f"{CLI_BLUE}[{task_id}] Starting LangGraph ReAct agent...{CLI_CLR}\n")
     
     try:
         # Выполняем агента с входным сообщением (системный промпт в начале)
@@ -1421,22 +1976,29 @@ After a company merger/acquisition (M&A), rules may have changed. The wiki conta
         # Выводим финальный результат
         if result and "messages" in result:
             final_message = result["messages"][-1]
-            logger.info(f"\n{CLI_BLUE}Agent completed.{CLI_CLR}")
-            logger.info(f"Final response: {final_message.content}")
+            logger.info(f"\n{CLI_BLUE}[{task_id}] Agent completed.{CLI_CLR}")
+            logger.info(f"[{task_id}] Final response: {final_message.content}")
+        
+        # Получаем состояние надёжным способом - сначала по task_id из глобального хранилища
+        if task_id in _task_states:
+            state = _task_states[task_id]
+        else:
+            state = _get_thread_state()
         
         # Если агент по какой-то причине не вызвал Req_ProvideAgentResponse, добиваем задачу автоматически
-        if not _response_provided:
+        if not state['response_provided']:
             try:
-                if _verified and _last_verify_payload:
-                    message = _last_verify_payload.get("reasoning") or "Auto-submitted based on verification step."
-                    outcome = _last_verify_payload.get("outcome") or "error_internal"
+                if state['verified'] and state['last_verify_payload']:
+                    last_verify_payload = state['last_verify_payload']
+                    message = last_verify_payload.get("reasoning") or "Auto-submitted based on verification step."
+                    outcome = last_verify_payload.get("outcome") or "error_internal"
                     safe_outcomes_no_links = {"error_internal", "denied_security", "none_unsupported"}
                     links: List[Dict[str, str]] = []
                     if outcome not in safe_outcomes_no_links:
                         for kind, raw in [
-                            ("employee", _last_verify_payload.get("employee_links")),
-                            ("project", _last_verify_payload.get("project_links")),
-                            ("customer", _last_verify_payload.get("customer_links")),
+                            ("employee", last_verify_payload.get("employee_links")),
+                            ("project", last_verify_payload.get("project_links")),
+                            ("customer", last_verify_payload.get("customer_links")),
                         ]:
                             if raw and raw.lower() != "none":
                                 for item in raw.split(","):
@@ -1450,19 +2012,25 @@ After a company merger/acquisition (M&A), rules may have changed. The wiki conta
                         links=links
                     )
                     store_api.dispatch(auto_req)
-                    _response_provided = True
-                    logger.info(f"{CLI_GREEN}OUT{CLI_CLR}: Auto-called Req_ProvideAgentResponse because the agent finished without it.")
+                    state['response_provided'] = True
+                    logger.info(f"{CLI_GREEN}[{task_id}] OUT{CLI_CLR}: Auto-called Req_ProvideAgentResponse because the agent finished without it.")
                 else:
-                    logger.warning(f"{CLI_RED}WARNING{CLI_CLR}: Agent finished without Req_ProvideAgentResponse and no verify payload to auto-complete.")
+                    logger.warning(f"{CLI_RED}[{task_id}] WARNING{CLI_CLR}: Agent finished without Req_ProvideAgentResponse and no verify payload to auto-complete.")
             except Exception as auto_e:
                 logger.error(f"{CLI_RED}Failed to auto-complete with Req_ProvideAgentResponse: {auto_e}{CLI_CLR}")
             
     except Exception as e:
         error_str = str(e)
-        logger.error(f"{CLI_RED}Agent error: {error_str}{CLI_CLR}")
+        logger.error(f"{CLI_RED}[{task_id}] Agent error: {error_str}{CLI_CLR}")
+        
+        # Получаем состояние надёжным способом
+        if task_id in _task_states:
+            state = _task_states[task_id]
+        else:
+            state = _get_thread_state()
         
         # Если ответ еще не был предоставлен и это ошибка API, попробуем отправить error_internal
-        if not _response_provided:
+        if not state['response_provided']:
             try:
                 # Попытаемся предоставить ответ об ошибке
                 error_request = dev.Req_ProvideAgentResponse(
@@ -1472,11 +2040,14 @@ After a company merger/acquisition (M&A), rules may have changed. The wiki conta
                     links=[]
                 )
                 store_api.dispatch(error_request)
-                logger.info(f"{CLI_BLUE}Sent error_internal response due to agent failure{CLI_CLR}")
+                state['response_provided'] = True
+                logger.info(f"{CLI_BLUE}[{task_id}] Sent error_internal response due to agent failure{CLI_CLR}")
             except Exception as inner_e:
-                logger.error(f"{CLI_RED}Failed to send error response: {inner_e}{CLI_CLR}")
+                logger.error(f"{CLI_RED}[{task_id}] Failed to send error response: {inner_e}{CLI_CLR}")
         
         raise
     finally:
         # Гарантируем логирование статистики после завершения задачи
         erc3_callback.log_final_stats()
+        # Очищаем состояние задачи
+        _cleanup_task_state(task_id)
